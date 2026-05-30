@@ -1,0 +1,13 @@
+from prefect_sqlalchemy import SqlAlchemyConnector
+
+database_block = SqlAlchemyConnector.load("pg-db-auth")
+with database_block:
+    ...
+from prefect.blocks.system import Secret
+
+Secret(value="sk-1234567890").save("daf-geodkv-api", overwrite=True)
+
+secret_block = Secret.load("BLOCK_NAME")
+
+# Access the stored secret
+secret_block.get()
