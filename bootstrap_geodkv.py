@@ -1,6 +1,6 @@
 """
 bootstrap_geodkv.py — Prefect flow til at initialisere geodkv-schema i PostGIS.
- 
+
 Trin:
   1. Sørg for at schema 'geodkv' + metadata-tabeller findes
   2. Live-introspect DAF GraphQL (https://graphql.datafordeler.dk/GEODKV/v2)
@@ -9,7 +9,7 @@ Trin:
   5. Auto-generér DDL pr. entitet og opret alle entitets-tabeller (idempotent)
   6. Upsert _sync_metadata med alle entiteter (status='pending')
   7. Log én række i _schema_runs med fuldt snapshot + drift-resultat
- 
+
 Forudsætninger på Prefect-serveren:
   - Block 'daf-geodkv-api' (Secret) med DAF API-nøglen
   - Block 'pg-db-auth' (SqlAlchemyConnector) til PostGIS-databasen
@@ -17,25 +17,27 @@ Forudsætninger på Prefect-serveren:
   - pip-pakken 'httpx' installeret i Prefect-venv'et:
       sudo -iu prefect /opt/prefect/venv/bin/pip install httpx
 """
- 
+
 from __future__ import annotations
- 
+
 import json
 import re
- 
+
 import httpx
 from prefect import flow, get_run_logger, task
 from prefect.blocks.system import Secret
 from prefect_sqlalchemy import SqlAlchemyConnector
- 
- 
+from sqlalchemy import text
+from sqlalchemy.engine import Engine
+
+
 # ---------------------------------------------------------------------------
 # Konfiguration
 # ---------------------------------------------------------------------------
- 
+
 DAF_GRAPHQL_URL = "https://graphql.datafordeler.dk/GEODKV/v2"
 SCHEMA_NAME = "geodkv"
- 
+
 # Skalar GraphQL-typer → Postgres-typer
 SCALAR_TO_PG: dict[str, str] = {
     "String": "text",
@@ -46,30 +48,30 @@ SCALAR_TO_PG: dict[str, str] = {
     "DafDateTime": "timestamptz",
     "Char": "char(1)",
 }
- 
+
 # Mønster for spatial-typer fra DAF, fx 'SpatialMultiPolygonZEpsg25832Type'
 SPATIAL_PATTERN = re.compile(
     r"^Spatial(?P<multi>Multi)?(?P<shape>Point|LineString|Polygon)"
     r"(?P<z>Z)?Epsg(?P<srid>\d+)Type$"
 )
- 
- 
+
+
 # ---------------------------------------------------------------------------
 # Hjælpere: navngivning og type-mapping
 # ---------------------------------------------------------------------------
- 
+
 def to_snake_case(name: str) -> str:
     """camelCase / PascalCase → snake_case. Acronymer bliver til ét ord."""
     s1 = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", name)
     s2 = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", s1)
     return s2.lower()
- 
- 
+
+
 def entity_to_table(graphql_type: str) -> str:
     # GEODKV_Afvandingsgroeft → afvandingsgroeft
     return to_snake_case(graphql_type.removeprefix("GEODKV_"))
- 
- 
+
+
 def graphql_type_to_pg(type_name: str | None) -> str | None:
     """Returnér Postgres-type for en GraphQL-typenavn, eller None hvis ukendt."""
     if not type_name:
@@ -84,8 +86,8 @@ def graphql_type_to_pg(type_name: str | None) -> str | None:
         srid = m.group("srid")
         return f"geometry({multi}{shape}{z}, {srid})"
     return None
- 
- 
+
+
 def unwrap_type(type_ref: dict | None) -> tuple[str | None, bool]:
     """Skræl NON_NULL/LIST-wrappers af; returnér (typenavn, non_null-flag)."""
     non_null = False
@@ -99,12 +101,12 @@ def unwrap_type(type_ref: dict | None) -> tuple[str | None, bool]:
         else:
             return type_ref.get("name"), non_null
     return None, non_null
- 
- 
+
+
 # ---------------------------------------------------------------------------
 # GraphQL introspection
 # ---------------------------------------------------------------------------
- 
+
 INTROSPECTION_QUERY = """
 query Introspect {
   __schema {
@@ -128,8 +130,8 @@ query Introspect {
   }
 }
 """
- 
- 
+
+
 @task(retries=2, retry_delay_seconds=10)
 def fetch_introspection(api_key: str) -> dict:
     logger = get_run_logger()
@@ -146,8 +148,8 @@ def fetch_introspection(api_key: str) -> dict:
     type_count = len(data["data"]["__schema"]["types"])
     logger.info(f"Hentede introspection fra DAF ({type_count} types i alt)")
     return data["data"]["__schema"]
- 
- 
+
+
 @task
 def parse_entities(schema_data: dict) -> list[dict]:
     """Find alle entiteter — defineret som GEODKV_-typer med datafordelerRowId."""
@@ -162,13 +164,13 @@ def parse_entities(schema_data: dict) -> list[dict]:
         # Hop Connection/Edge/Page-helpers over
         if name.endswith(("Connection", "Edge")):
             continue
- 
+
         fields = t.get("fields") or []
         field_names = {f["name"] for f in fields}
         # Entiteter har altid datafordelerRowId
         if "datafordelerRowId" not in field_names:
             continue
- 
+
         parsed_fields = []
         for f in fields:
             type_name, non_null = unwrap_type(f["type"])
@@ -177,7 +179,7 @@ def parse_entities(schema_data: dict) -> list[dict]:
                 "type": type_name,
                 "non_null": non_null,
             })
- 
+
         entities.append({
             "graphql_type": name,
             "entity_name": name.removeprefix("GEODKV_"),
@@ -185,22 +187,22 @@ def parse_entities(schema_data: dict) -> list[dict]:
             "has_kommunekode": "kommunekode" in field_names,
             "fields": parsed_fields,
         })
- 
+
     entities.sort(key=lambda e: e["graphql_type"])
     logger.info(f"Identificerede {len(entities)} entiteter")
     return entities
- 
- 
+
+
 # ---------------------------------------------------------------------------
 # DDL-generering
 # ---------------------------------------------------------------------------
- 
+
 def build_create_table(entity: dict) -> tuple[str, list[str]]:
     """Returnér (DDL-streng, liste over felter sprunget over pga. ukendt type)."""
     lines: list[str] = []
     skipped: list[str] = []
     geom_col: str | None = None
- 
+
     for f in entity["fields"]:
         col_name = to_snake_case(f["name"])
         pg_type = graphql_type_to_pg(f["type"])
@@ -211,17 +213,17 @@ def build_create_table(entity: dict) -> tuple[str, list[str]]:
         lines.append(f'  "{col_name}" {pg_type}{null_part}')
         if pg_type.startswith("geometry("):
             geom_col = col_name
- 
+
     # Primær nøgle: datafordeler_row_id (UUID, antaget unik pr. række)
     lines.append('  PRIMARY KEY ("datafordeler_row_id")')
- 
+
     table = f"{SCHEMA_NAME}.{entity['table_name']}"
     ddl = (
         f"CREATE TABLE IF NOT EXISTS {table} (\n"
         + ",\n".join(lines)
         + "\n);"
     )
- 
+
     # GIST-index på geometri, hvis tabellen har en geometrikolonne
     if geom_col:
         idx_name = f"{entity['table_name']}_{geom_col}_gix"
@@ -229,17 +231,17 @@ def build_create_table(entity: dict) -> tuple[str, list[str]]:
             f'\nCREATE INDEX IF NOT EXISTS {idx_name} '
             f'ON {table} USING GIST ("{geom_col}");'
         )
- 
+
     return ddl, skipped
- 
- 
+
+
 # ---------------------------------------------------------------------------
 # Database-tasks
 # ---------------------------------------------------------------------------
- 
+
 METADATA_DDL = f"""
 CREATE SCHEMA IF NOT EXISTS {SCHEMA_NAME};
- 
+
 CREATE TABLE IF NOT EXISTS {SCHEMA_NAME}._sync_metadata (
     entity_name        text PRIMARY KEY,
     graphql_type       text NOT NULL,
@@ -253,7 +255,7 @@ CREATE TABLE IF NOT EXISTS {SCHEMA_NAME}._sync_metadata (
     created_at         timestamptz NOT NULL DEFAULT now(),
     updated_at         timestamptz NOT NULL DEFAULT now()
 );
- 
+
 CREATE TABLE IF NOT EXISTS {SCHEMA_NAME}._schema_runs (
     id                 bigserial PRIMARY KEY,
     run_at             timestamptz NOT NULL DEFAULT now(),
@@ -264,41 +266,43 @@ CREATE TABLE IF NOT EXISTS {SCHEMA_NAME}._schema_runs (
     notes              text
 );
 """
- 
- 
+
+
 @task
-def ensure_schema_and_metadata_tables(connector: SqlAlchemyConnector) -> None:
+def ensure_schema_and_metadata_tables(engine: Engine) -> None:
     logger = get_run_logger()
-    with connector as db:
-        db.execute(METADATA_DDL)
+    with engine.connect() as conn:
+        conn.execute(text(METADATA_DDL))
+        conn.commit()
     logger.info(f"Schema '{SCHEMA_NAME}' + metadata-tabeller er klar")
- 
- 
+
+
 @task
-def detect_drift(connector: SqlAlchemyConnector, entities: list[dict]) -> dict:
+def detect_drift(engine: Engine, entities: list[dict]) -> dict:
     """Sammenlign mod sidste snapshot. Første kørsel = baseline, ingen drift."""
     logger = get_run_logger()
- 
-    with connector as db:
-        rows = db.fetch_all(
+
+    with engine.connect() as conn:
+        result = conn.execute(text(
             f"SELECT schema_snapshot FROM {SCHEMA_NAME}._schema_runs "
             f"ORDER BY run_at DESC LIMIT 1"
-        )
- 
+        ))
+        rows = result.fetchall()
+
     if not rows:
         logger.info("Ingen tidligere snapshot — baseline etableres ved denne kørsel")
         return {"is_first_run": True, "drift_detected": False, "summary": None}
- 
+
     previous = rows[0][0]
     if isinstance(previous, str):
         previous = json.loads(previous)
- 
+
     prev_map = {e["graphql_type"]: e for e in previous.get("entities", [])}
     curr_map = {e["graphql_type"]: e for e in entities}
- 
+
     added = sorted(set(curr_map) - set(prev_map))
     removed = sorted(set(prev_map) - set(curr_map))
- 
+
     field_changes: list[str] = []
     for name in sorted(set(curr_map) & set(prev_map)):
         prev_fields = {f["name"]: f for f in prev_map[name]["fields"]}
@@ -322,7 +326,7 @@ def detect_drift(connector: SqlAlchemyConnector, entities: list[dict]) -> dict:
             if f_changed:
                 parts.append(f"~{f_changed}")
             field_changes.append(f"{name}: " + " ".join(parts))
- 
+
     drift = bool(added or removed or field_changes)
     summary_parts: list[str] = []
     if added:
@@ -332,15 +336,15 @@ def detect_drift(connector: SqlAlchemyConnector, entities: list[dict]) -> dict:
     if field_changes:
         summary_parts.append("Felt-ændringer:\n  " + "\n  ".join(field_changes))
     summary = "\n".join(summary_parts) if summary_parts else None
- 
+
     if drift:
         logger.warning(f"Schema-drift opdaget:\n{summary}")
     else:
         logger.info("Ingen schema-drift siden sidste kørsel")
- 
+
     return {"is_first_run": False, "drift_detected": drift, "summary": summary}
- 
- 
+
+
 @task
 def create_entity_tables(
     connector: SqlAlchemyConnector,
@@ -362,8 +366,8 @@ def create_entity_tables(
                 )
     logger.info(f"Oprettede/verificerede {created} entitets-tabeller")
     return {"created": created, "skipped": skipped_by_entity}
- 
- 
+
+
 @task
 def populate_sync_metadata(
     connector: SqlAlchemyConnector,
@@ -393,8 +397,8 @@ def populate_sync_metadata(
                 },
             )
     logger.info(f"Upsertede {len(entities)} rækker i _sync_metadata")
- 
- 
+
+
 @task
 def log_schema_run(
     connector: SqlAlchemyConnector,
@@ -412,7 +416,7 @@ def log_schema_run(
             f"Felter sprunget over: {json.dumps(skipped_fields, ensure_ascii=False)}"
         )
     notes = " | ".join(notes_parts) if notes_parts else None
- 
+
     sql = f"""
         INSERT INTO {SCHEMA_NAME}._schema_runs
             (entity_count, schema_snapshot, drift_detected, drift_summary, notes)
@@ -431,29 +435,29 @@ def log_schema_run(
             },
         )
     logger.info("Skrev række til _schema_runs")
- 
- 
+
+
 # ---------------------------------------------------------------------------
 # Hoved-flow
 # ---------------------------------------------------------------------------
- 
+
 @flow(name="bootstrap_geodkv", log_prints=True)
 def bootstrap_geodkv() -> None:
     api_key = Secret.load("daf-geodkv-api").get()
     connector = SqlAlchemyConnector.load("pg-db-auth")
- 
+
     # Metadata-tabeller skal eksistere FØR vi kan slå sidste snapshot op
     ensure_schema_and_metadata_tables(connector)
- 
+
     schema_data = fetch_introspection(api_key)
     entities = parse_entities(schema_data)
- 
+
     drift = detect_drift(connector, entities)
     table_result = create_entity_tables(connector, entities)
     populate_sync_metadata(connector, entities)
     log_schema_run(connector, entities, drift, table_result["skipped"])
- 
- 
+
+
 if __name__ == "__main__":
     # Lokal/manuel kørsel — kører flowet direkte i denne proces.
     # Til at registrere som Prefect-deployment fra serverens git-clone:
@@ -464,4 +468,3 @@ if __name__ == "__main__":
     #         entrypoint="bootstrap_geodkv.py:bootstrap_geodkv",
     #     ).deploy(name="bootstrap-geodkv", work_pool_name="default-pool")
     bootstrap_geodkv()
- 
