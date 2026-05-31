@@ -26,9 +26,10 @@ import re
 import httpx
 from prefect import flow, get_run_logger, task
 from prefect.blocks.system import Secret
+from prefect.cache_policies import NO_CACHE
 from prefect_sqlalchemy import SqlAlchemyConnector
-from sqlalchemy import text
-from sqlalchemy.engine import Engine
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine, URL
 
 
 # ---------------------------------------------------------------------------
@@ -239,6 +240,40 @@ def build_create_table(entity: dict) -> tuple[str, list[str]]:
 # Database-tasks
 # ---------------------------------------------------------------------------
 
+def build_clean_engine(connector: SqlAlchemyConnector) -> Engine:
+    """Byg en ren SQLAlchemy-engine fra connector'en.
+
+    prefect-sqlalchemy's egen engine-konstruktion lækker Pydantic-interne
+    attributter (fx '__prefect_kind') ind i de kwargs der sendes til psycopg2's
+    DSN-parser, hvilket får psycopg2 til at fejle. Vi omgår det ved at trække
+    de relevante connection-felter ud manuelt og bygge en ren URL.
+    """
+    ci = connector.connection_info
+
+    # Hvis blokken er konfigureret med en URL-streng, brug den direkte
+    if isinstance(ci, str):
+        return create_engine(ci)
+
+    # Ellers er det en ConnectionComponents (Pydantic-model)
+    password = ci.password
+    if password is not None and hasattr(password, "get_secret_value"):
+        password = password.get_secret_value()
+
+    driver = ci.driver
+    if hasattr(driver, "value"):  # AsyncDriver/SyncDriver enum
+        driver = driver.value
+
+    url = URL.create(
+        drivername=str(driver),
+        username=ci.username,
+        password=password,
+        host=ci.host,
+        port=ci.port,
+        database=ci.database,
+    )
+    return create_engine(url)
+
+
 METADATA_DDL = f"""
 CREATE SCHEMA IF NOT EXISTS {SCHEMA_NAME};
 
@@ -268,7 +303,7 @@ CREATE TABLE IF NOT EXISTS {SCHEMA_NAME}._schema_runs (
 """
 
 
-@task
+@task(cache_policy=NO_CACHE)
 def ensure_schema_and_metadata_tables(engine: Engine) -> None:
     logger = get_run_logger()
     with engine.connect() as conn:
@@ -277,7 +312,7 @@ def ensure_schema_and_metadata_tables(engine: Engine) -> None:
     logger.info(f"Schema '{SCHEMA_NAME}' + metadata-tabeller er klar")
 
 
-@task
+@task(cache_policy=NO_CACHE)
 def detect_drift(engine: Engine, entities: list[dict]) -> dict:
     """Sammenlign mod sidste snapshot. Første kørsel = baseline, ingen drift."""
     logger = get_run_logger()
@@ -345,7 +380,7 @@ def detect_drift(engine: Engine, entities: list[dict]) -> dict:
     return {"is_first_run": False, "drift_detected": drift, "summary": summary}
 
 
-@task
+@task(cache_policy=NO_CACHE)
 def create_entity_tables(
     engine: Engine,
     entities: list[dict],
@@ -369,7 +404,7 @@ def create_entity_tables(
     return {"created": created, "skipped": skipped_by_entity}
 
 
-@task
+@task(cache_policy=NO_CACHE)
 def populate_sync_metadata(
     engine: Engine,
     entities: list[dict],
@@ -401,7 +436,7 @@ def populate_sync_metadata(
     logger.info(f"Upsertede {len(entities)} rækker i _sync_metadata")
 
 
-@task
+@task(cache_policy=NO_CACHE)
 def log_schema_run(
     engine: Engine,
     entities: list[dict],
@@ -448,9 +483,9 @@ def log_schema_run(
 def bootstrap_geodkv() -> None:
     api_key = Secret.load("daf-geodkv-api").get()
     connector = SqlAlchemyConnector.load("pg-db-auth")
-    # Hent SQLAlchemy-engine direkte; bypass'er prefect-sqlalchemy's buggy
-    # connection-wrapper (lækker '__prefect_kind' ind i psycopg2's DSN).
-    engine = connector.get_engine()
+    # Byg en clean engine manuelt — prefect-sqlalchemy lækker Pydantic-interne
+    # attributter ind i psycopg2's DSN, så vi bygger URL'en selv.
+    engine = build_clean_engine(connector)
 
     # Metadata-tabeller skal eksistere FØR vi kan slå sidste snapshot op
     ensure_schema_and_metadata_tables(engine)
