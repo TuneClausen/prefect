@@ -1,7 +1,7 @@
 # prefect
 
 # deploy from git example
-´´
+´´´
 cat > /tmp/deploy_bootstrap.py << 'EOF'
 from prefect import flow
 flow.from_source(
