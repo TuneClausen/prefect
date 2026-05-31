@@ -347,16 +347,16 @@ def detect_drift(engine: Engine, entities: list[dict]) -> dict:
 
 @task
 def create_entity_tables(
-    connector: SqlAlchemyConnector,
+    engine: Engine,
     entities: list[dict],
 ) -> dict:
     logger = get_run_logger()
     skipped_by_entity: dict[str, list[str]] = {}
     created = 0
-    with connector as db:
+    with engine.connect() as conn:
         for entity in entities:
             ddl, skipped = build_create_table(entity)
-            db.execute(ddl)
+            conn.execute(text(ddl))
             created += 1
             if skipped:
                 skipped_by_entity[entity["entity_name"]] = skipped
@@ -364,17 +364,18 @@ def create_entity_tables(
                     f"{entity['entity_name']}: sprunget over felter med "
                     f"ukendt type: {skipped}"
                 )
+        conn.commit()
     logger.info(f"Oprettede/verificerede {created} entitets-tabeller")
     return {"created": created, "skipped": skipped_by_entity}
 
 
 @task
 def populate_sync_metadata(
-    connector: SqlAlchemyConnector,
+    engine: Engine,
     entities: list[dict],
 ) -> None:
     logger = get_run_logger()
-    sql = f"""
+    sql = text(f"""
         INSERT INTO {SCHEMA_NAME}._sync_metadata
             (entity_name, graphql_type, table_name, has_kommunekode, status)
         VALUES
@@ -384,24 +385,25 @@ def populate_sync_metadata(
             table_name      = EXCLUDED.table_name,
             has_kommunekode = EXCLUDED.has_kommunekode,
             updated_at      = now()
-    """
-    with connector as db:
+    """)
+    with engine.connect() as conn:
         for entity in entities:
-            db.execute(
+            conn.execute(
                 sql,
-                parameters={
+                {
                     "entity_name": entity["entity_name"],
                     "graphql_type": entity["graphql_type"],
                     "table_name": entity["table_name"],
                     "has_kommunekode": entity["has_kommunekode"],
                 },
             )
+        conn.commit()
     logger.info(f"Upsertede {len(entities)} rækker i _sync_metadata")
 
 
 @task
 def log_schema_run(
-    connector: SqlAlchemyConnector,
+    engine: Engine,
     entities: list[dict],
     drift: dict,
     skipped_fields: dict[str, list[str]],
@@ -417,16 +419,16 @@ def log_schema_run(
         )
     notes = " | ".join(notes_parts) if notes_parts else None
 
-    sql = f"""
+    sql = text(f"""
         INSERT INTO {SCHEMA_NAME}._schema_runs
             (entity_count, schema_snapshot, drift_detected, drift_summary, notes)
         VALUES
             (:entity_count, :snapshot, :drift_detected, :summary, :notes)
-    """
-    with connector as db:
-        db.execute(
+    """)
+    with engine.connect() as conn:
+        conn.execute(
             sql,
-            parameters={
+            {
                 "entity_count": len(entities),
                 "snapshot": json.dumps(snapshot, ensure_ascii=False),
                 "drift_detected": drift["drift_detected"],
@@ -434,6 +436,7 @@ def log_schema_run(
                 "notes": notes,
             },
         )
+        conn.commit()
     logger.info("Skrev række til _schema_runs")
 
 
@@ -445,17 +448,20 @@ def log_schema_run(
 def bootstrap_geodkv() -> None:
     api_key = Secret.load("daf-geodkv-api").get()
     connector = SqlAlchemyConnector.load("pg-db-auth")
+    # Hent SQLAlchemy-engine direkte; bypass'er prefect-sqlalchemy's buggy
+    # connection-wrapper (lækker '__prefect_kind' ind i psycopg2's DSN).
+    engine = connector.get_engine()
 
     # Metadata-tabeller skal eksistere FØR vi kan slå sidste snapshot op
-    ensure_schema_and_metadata_tables(connector)
+    ensure_schema_and_metadata_tables(engine)
 
     schema_data = fetch_introspection(api_key)
     entities = parse_entities(schema_data)
 
-    drift = detect_drift(connector, entities)
-    table_result = create_entity_tables(connector, entities)
-    populate_sync_metadata(connector, entities)
-    log_schema_run(connector, entities, drift, table_result["skipped"])
+    drift = detect_drift(engine, entities)
+    table_result = create_entity_tables(engine, entities)
+    populate_sync_metadata(engine, entities)
+    log_schema_run(engine, entities, drift, table_result["skipped"])
 
 
 if __name__ == "__main__":
